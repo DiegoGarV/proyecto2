@@ -13,6 +13,8 @@
 
 static const char DIGITS[] = "abcdefghijklmnopqrstuvwxyz0123456789";
 static const int RADIX = 36;
+typedef enum { STRAT_CONTIG = 0, STRAT_SHUFFLE = 1 } Strategy;
+
 
 // ---------------- Configuración ----------------
 typedef struct {
@@ -26,6 +28,8 @@ typedef struct {
     // Debug
     int debug;                // 1=on (default), 0=off
     uint64_t progress_step;   // cada cuántos intentos imprimir progreso (default 5e6)
+
+    Strategy strategy;
 } Config;
 
 static void die(const char* msg) {
@@ -103,7 +107,9 @@ static void parse_args(int argc, char** argv, Config* cfg) {
     cfg->print_targets = 0;
 
     cfg->debug = 1;
-    cfg->progress_step = 5000000ULL; // 5e6
+    cfg->progress_step = 5000000ULL;
+
+    cfg->strategy = STRAT_CONTIG;
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--prefix") && i+1 < argc) cfg->prefix = argv[++i];
@@ -114,6 +120,12 @@ static void parse_args(int argc, char** argv, Config* cfg) {
         else if (!strcmp(argv[i], "--print_targets") && i+1 < argc) cfg->print_targets = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--debug") && i+1 < argc) cfg->debug = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--progress_step") && i+1 < argc) cfg->progress_step = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--strategy") && i+1 < argc) {
+            const char* s = argv[++i];
+            if (!strcmp(s, "contig"))      cfg->strategy = STRAT_CONTIG;
+            else if (!strcmp(s, "shuffle")) cfg->strategy = STRAT_SHUFFLE;
+            else die("valor de --strategy inválido (use 'contig' o 'shuffle')");
+        }
     }
     if (cfg->len < 2) die("--len debe ser >= 2");
     if (cfg->n_live < 0) die("--n_live debe ser >= 0");
@@ -133,7 +145,32 @@ static void run_master(const Config* cfg, int world, uint64_t total, const uint6
     const uint64_t SUBSPACE = powu(RADIX, 2);
 
     int workers = world - 1;
+
+    // Estado continuo
     uint64_t next_task = 0;
+
+    // Estado barajado
+    uint64_t *ids = NULL, pos = 0;
+    if (cfg->strategy == STRAT_SHUFFLE) {
+        ids = (uint64_t*)malloc((size_t)SUBSPACE * sizeof(uint64_t));
+        if (!ids) die("malloc ids barajado");
+        for (uint64_t i = 0; i < SUBSPACE; ++i) ids[i] = i;
+
+        // Barajar (Fisher-Yates)
+        uint64_t s = cfg->seed ? cfg->seed : 1;
+        for (uint64_t i = SUBSPACE - 1; i > 0; --i) {
+            uint64_t j = splitmix64(&s) % (i + 1);
+            uint64_t t = ids[i]; ids[i] = ids[j]; ids[j] = t;
+        }
+        if (cfg->debug) {
+            printf("[master] Estrategia=SHUFFLE (cola barajada), seed=%" PRIu64 "\n", cfg->seed);
+            fflush(stdout);
+        }
+    } else if (cfg->debug) {
+        printf("[master] Estrategia=CONTIG (orden 0..N-1)\n");
+        fflush(stdout);
+    }
+
     int stop_broadcasted = 0;
 
     if (cfg->print_targets && cfg->n_live > 0) {
@@ -174,13 +211,19 @@ static void run_master(const Config* cfg, int world, uint64_t total, const uint6
             MPI_Recv(&dummy, 1, MPI_UINT64_T, st.MPI_SOURCE, TAG_REQ, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
             AssignMsg msg;
-            if (stop_broadcasted || next_task >= SUBSPACE) {
+            uint64_t remaining =
+                (cfg->strategy == STRAT_SHUFFLE) ? (SUBSPACE - pos) : (SUBSPACE - next_task);
+            
+            if (stop_broadcasted || remaining == 0) {
                 msg.valid = 0;
                 msg.subprefix_id = 0;
             } else {
                 msg.valid = 1;
-                msg.subprefix_id = next_task++;
+                msg.subprefix_id = (cfg->strategy == STRAT_SHUFFLE)
+                                     ? ids[pos++]
+                                     : next_task++;
             }
+
             MPI_Send(&msg, sizeof(msg), MPI_BYTE, st.MPI_SOURCE, TAG_ASSIGN, MPI_COMM_WORLD);
 
             if (cfg->debug) {
@@ -203,6 +246,9 @@ static void run_master(const Config* cfg, int world, uint64_t total, const uint6
         }
 
     }
+
+    // Liberar recursos en caso de barajado
+    if (ids) free(ids);
 }
 
 // ---------------- Trabajador ----------------
